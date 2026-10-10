@@ -42,6 +42,8 @@ pub enum CaptionsMsg {
     ModelChanged(i32),
     PlacementChanged(i32),
     SizeChanged(i32),
+    /// 0 original, 1 Spanish, 2 both.
+    LanguageChanged(i32),
     /// Run the pass the sheet describes.
     Begin,
     Cancel,
@@ -49,6 +51,9 @@ pub enum CaptionsMsg {
     Progress(i32),
     /// The transcriber's worker is done: what was said, or why not.
     Finished(Result<Vec<Segment>, String>),
+    /// The translator's worker is done: one Spanish line for each segment
+    /// that was heard, or why not.
+    Translated(Result<Vec<String>, String>),
 }
 
 /// The clip a transcription is running over, as the finished segments
@@ -76,12 +81,18 @@ pub struct CaptionsPane {
     pub placement: usize,
     /// 0 small, 1 medium, 2 large.
     pub size: usize,
+    /// 0 original, 1 Spanish, 2 both.
+    pub language: usize,
     pub running: bool,
+    /// The running pass is the translation.
+    pub translating: bool,
     pub progress: f32,
     /// Why the last run failed, when it did.
     pub message: String,
     /// The clip under the running transcription.
     subject: Option<Subject>,
+    /// What was heard, held while it is being translated.
+    pending: Vec<Segment>,
 }
 
 impl CaptionsPane {
@@ -103,6 +114,7 @@ impl CaptionsPane {
                     model,
                     placement: 0,
                     size: 1,
+                    language: 2,
                     ..CaptionsPane::default()
                 };
             }
@@ -113,6 +125,9 @@ impl CaptionsPane {
                 self.placement = (index.max(0) as usize).min(2);
             }
             CaptionsMsg::SizeChanged(index) => self.size = (index.max(0) as usize).min(2),
+            CaptionsMsg::LanguageChanged(index) => {
+                self.language = (index.max(0) as usize).min(2);
+            }
             CaptionsMsg::Begin => {
                 if self.clip.is_some() {
                     self.run_sound(studio);
@@ -123,6 +138,8 @@ impl CaptionsPane {
             CaptionsMsg::Cancel => {
                 studio.host.transcriber.cancel();
                 self.running = false;
+                self.translating = false;
+                self.pending.clear();
                 self.open = false;
             }
             CaptionsMsg::Progress(percent) => {
@@ -130,43 +147,115 @@ impl CaptionsPane {
             }
             CaptionsMsg::Finished(result) => {
                 self.running = false;
-                let subject = self.subject.take();
                 match result {
-                    Ok(segments) => {
-                        let Some(subject) = subject else {
-                            return;
-                        };
-                        let look = subject.look;
-                        let base = studio.prefs.title_style.clone();
-                        let commands: Vec<Command> = segments
-                            .into_iter()
-                            .filter_map(|segment| {
-                                let text = segment.text.trim().to_owned();
-                                (!text.is_empty()).then(|| {
-                                    caption_clip(
-                                        text,
-                                        subject.start + segment.start / subject.speed,
-                                        ((segment.end - segment.start) / subject.speed).max(0.2),
-                                        look,
-                                        base.as_ref(),
-                                    )
-                                })
-                            })
-                            .collect();
-                        let count = commands.len();
-                        self.open = false;
-                        if count == 0 {
-                            studio.notify(&t("captions.nothingSaidClip"), true);
-                        } else {
-                            studio.apply(Command::Batch { commands });
-                            studio.notify(&tf("captions.addedCaptions", &[&count]), false);
-                        }
+                    Ok(segments)
+                        if self.language > 0 && self.open && !segments.is_empty() && self.subject.is_some() =>
+                    {
+                        self.begin_translation(segments);
                     }
+                    Ok(segments) => self.place(studio, segments, None),
                     // Asked for: the sheet is already on its way down.
-                    Err(error) if error.contains("cancel") => self.open = false,
-                    Err(error) => self.message = error,
+                    Err(error) if error.contains("cancel") => {
+                        self.subject = None;
+                        self.open = false;
+                    }
+                    Err(error) => {
+                        self.subject = None;
+                        self.message = error;
+                    }
                 }
             }
+            CaptionsMsg::Translated(result) => {
+                // Cancelled, or the project closed, while it ran: nothing
+                // is waiting for these lines.
+                if !self.running {
+                    return;
+                }
+                self.running = false;
+                self.translating = false;
+                let segments = std::mem::take(&mut self.pending);
+                match result {
+                    Ok(lines) => self.place(studio, segments, Some(lines)),
+                    Err(error) => {
+                        // The words were heard; they are not thrown away
+                        // for want of a translation.
+                        studio.notify(&tf("captions.translationFailed", &[&error]), true);
+                        self.place(studio, segments, None);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The heard words to the translator on a worker, reporting into the
+    /// sheet as it goes. The sheet stays up: it is still the progress report.
+    fn begin_translation(&mut self, segments: Vec<Segment>) {
+        let lines: Vec<String> = segments
+            .iter()
+            .map(|segment| segment.text.trim().to_owned())
+            .collect();
+        self.pending = segments;
+        self.running = true;
+        self.translating = true;
+        self.progress = 0.0;
+        let epoch = crate::host::project_epoch();
+        spawn_in_project(
+            move || {
+                concat_speech::translate::to_spanish(&lines, move |percent| {
+                    on_ui_in_project(epoch, move |studio, _, _| {
+                        studio.handle(Msg::Captions(CaptionsMsg::Progress(percent)));
+                    });
+                })
+            },
+            |studio, _, _, result| studio.handle(Msg::Captions(CaptionsMsg::Translated(result))),
+        );
+    }
+
+    /// The finished words as titles on the timeline: the original, the
+    /// Spanish or both, by the sheet's language. `translated` is one line
+    /// for each segment, when there is a translation.
+    fn place(&mut self, studio: &mut Studio, segments: Vec<Segment>, translated: Option<Vec<String>>) {
+        let Some(subject) = self.subject.take() else {
+            return;
+        };
+        let look = subject.look;
+        let base = studio.prefs.title_style.clone();
+        let mode = if translated.is_some() { self.language } else { 0 };
+        let mut commands: Vec<Command> = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            let original = segment.text.trim().to_owned();
+            if original.is_empty() {
+                continue;
+            }
+            let spanish = translated
+                .as_ref()
+                .and_then(|lines| lines.get(index))
+                .map(|line| line.trim().to_owned())
+                .filter(|line| !line.is_empty());
+            let text = match (mode, spanish) {
+                (1, Some(spanish)) => wrap_caption(&spanish).join("\n"),
+                (2, Some(spanish)) => format!(
+                    "{}\n{}",
+                    wrap_caption(&original).join("\n"),
+                    wrap_caption(&spanish).join("\n")
+                ),
+                _ => original,
+            };
+            commands.push(caption_clip(
+                text,
+                subject.start + segment.start / subject.speed,
+                ((segment.end - segment.start) / subject.speed).max(0.2),
+                look,
+                base.as_ref(),
+            ));
+        }
+        let count = commands.len();
+        self.open = false;
+        if count == 0 {
+            studio.notify(&t("captions.nothingSaidClip"), true);
+        } else {
+            studio.apply(Command::Batch { commands });
+            studio.notify(&tf("captions.addedCaptions", &[&count]), false);
         }
     }
 
@@ -259,6 +348,8 @@ impl CaptionsPane {
             model: self.model as i32,
             placement: self.placement as i32,
             size: self.size as i32,
+            language: self.language as i32,
+            translating: self.translating && self.running,
             running: self.running,
             progress: self.progress,
             ready: !installed(&studio.settings.transcribers).is_empty(),

@@ -20,6 +20,7 @@
 #[cfg(feature = "chatterbox")]
 pub mod chatterbox;
 pub mod transcribe;
+pub mod translate;
 pub mod tts;
 
 pub use transcribe::Transcriber;

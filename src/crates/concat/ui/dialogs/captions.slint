@@ -39,6 +39,11 @@ export struct CaptionsSheetData {
     ready: bool,
     /// Why the last run failed, when it did.
     message: string,
+    /// 0 Original, 1 Spanish, 2 both: what the captions say once the
+    /// transcriber has heard the sound.
+    language: int,
+    /// The running pass is the translation, not the transcription.
+    translating: bool,
 }
 
 export component CaptionsDialog inherits Modal {
@@ -50,6 +55,7 @@ export component CaptionsDialog inherits Modal {
     callback model-changed(index: int);
     callback placement-changed(index: int);
     callback size-changed(index: int);
+    callback language-changed(index: int);
     callback begin();
     callback cancel();
 
@@ -154,6 +160,15 @@ export component CaptionsDialog inherits Modal {
         if !root.data.running: DialogSection {
             title: I18n.t("captions.captions");
 
+            if root.from-sound: DialogRow {
+                label: I18n.t("captions.language");
+                SegmentedControl {
+                    options: [I18n.t("captions.languageOriginal"), I18n.t("captions.languageSpanish"), I18n.t("captions.languageBoth")];
+                    current: root.data.language;
+                    changed(index) => { root.language-changed(index); }
+                }
+            }
+
             DialogRow {
                 label: I18n.t("captions.placement");
                 SegmentedControl {
@@ -224,7 +239,7 @@ export component CaptionsDialog inherits Modal {
 
                 Text {
                     horizontal-stretch: 1;
-                    text: root.data.progress < 0.02 ? I18n.t("captions.loadingTheModel") : I18n.t("captions.transcribing");
+                    text: root.data.translating ? I18n.t("captions.translating") : (root.data.progress < 0.02 ? I18n.t("captions.loadingTheModel") : I18n.t("captions.transcribing"));
                     color: Theme.fg;
                     font-size: Theme.fs;
                     vertical-alignment: center;

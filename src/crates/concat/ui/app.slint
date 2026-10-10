@@ -290,6 +290,7 @@ export component App inherits Window {
     callback captions-model-changed(index: int);
     callback captions-placement-changed(index: int);
     callback captions-size-changed(index: int);
+    callback captions-language-changed(index: int);
     callback captions-begin();
     callback captions-cancel();
 
@@ -830,6 +831,7 @@ export component App inherits Window {
         model-changed(index) => { root.captions-model-changed(index); }
         placement-changed(index) => { root.captions-placement-changed(index); }
         size-changed(index) => { root.captions-size-changed(index); }
+        language-changed(index) => { root.captions-language-changed(index); }
         begin => { root.captions-begin(); }
         cancel => { root.captions-cancel(); }
     }
